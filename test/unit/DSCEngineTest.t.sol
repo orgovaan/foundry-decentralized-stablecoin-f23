@@ -12,9 +12,13 @@ import {MockV3Aggregator} from "../mocks/MockV3Aggregator.sol";
 import {MockDscFailedMint} from "../mocks/MockDscFailedMint.sol";
 import {MockWethFailedTransferFrom} from "../mocks/MockWethFailedTransferFrom.sol";
 import {MockWethFailedTransfer} from "../mocks/MockWethFailedTransfer.sol";
-import "forge-std/console.sol"; //for logging
+import {MockMoreDebtDsc} from "../mocks/MockMoreDebtDsc.sol";
+import {console} from "forge-std/console.sol"; //for logging
 
 contract DSCEngineTest is Test {
+    //the following event is 100% from DSCEngine.sol. We need it here otherwise it would not be accessible.
+    event CollateralRedeemed(address indexed redeemFrom, address indexed redeemTo, address token, uint256 amount); // if redeemFrom != redeemedTo, then it was liquidated
+
     DeployDSC deployer;
     DecentralizedStableCoin dsc;
     DSCEngine engine;
@@ -31,6 +35,14 @@ contract DSCEngineTest is Test {
     //these have default values but for testing purposes we sometimes change them
     uint256 public amountToMint = 100 ether;
     uint256 public constant amountCollateral = 10 ether; //this is only the amount. Price is set at $2000 a piece
+
+    uint256 public constant STARTING_USER_BALANCE = 10 ether;
+    uint256 public constant MIN_HEALTH_FACTOR = 1e18;
+    uint256 public constant LIQUIDATION_THRESHOLD = 50;
+
+    // Liquidation
+    address public liquidator = makeAddr("liquidator");
+    uint256 public collateralToCover = 20 ether;
 
     ////////////////////////////
     ////// Modifiers ///////////
@@ -49,6 +61,28 @@ contract DSCEngineTest is Test {
         ERC20Mock(weth).approve(address(engine), amountCollateral); //in order to deposit weth, we need to approve
         engine.depositCollateralAndMintDsc(weth, amountCollateral, amountToMint);
         vm.stopPrank();
+        _;
+    }
+
+    modifier liquidated() {
+        vm.startPrank(USER);
+        ERC20Mock(weth).approve(address(engine), amountCollateral);
+        engine.depositCollateralAndMintDsc(weth, amountCollateral, amountToMint);
+        vm.stopPrank();
+
+        int256 ethUsdUpdatedPrice = 18e8; // Crashing the price. 1 ETH = $18
+        MockV3Aggregator(ethUsdPriceFeed).updateAnswer(ethUsdUpdatedPrice);
+        uint256 userHealthFactor = engine.getHealthFactor(USER);
+
+        ERC20Mock(weth).mint(liquidator, collateralToCover); //Gives collateral balance to liquidator. collatralToCover is 20 ether
+
+        vm.startPrank(liquidator);
+        ERC20Mock(weth).approve(address(engine), collateralToCover); // deposits ALL his weth
+        engine.depositCollateralAndMintDsc(weth, collateralToCover, amountToMint); //liquidator mints after prices crashed
+        dsc.approve(address(engine), amountToMint);
+        engine.liquidate(weth, USER, amountToMint); //covering the USER's whole debt
+        vm.stopPrank();
+
         _;
     }
 
@@ -355,7 +389,7 @@ contract DSCEngineTest is Test {
         vm.stopPrank();
     }
 
-    function testCanRedeemDepositedCollateral() public depositedCollateral {
+    function testCanRedeemDepositedCollateralCallingRedeemCollateral() public depositedCollateral {
         console.log(ERC20Mock(weth).balanceOf(USER)); //just checking, should be 0 after depositing, before withdrawing
         vm.startPrank(USER);
         engine.redeemCollateral(weth, amountCollateral);
@@ -364,4 +398,226 @@ contract DSCEngineTest is Test {
         uint256 userBalance = ERC20Mock(weth).balanceOf(USER);
         assertEq(userBalance, amountCollateral);
     }
+
+    //Cyfrin version looks unneccesarily complex
+    function testRevertIfRedeemAmountIsZero() public depositedCollateral {
+        //collateral depositied via the modifier
+        vm.startPrank(USER);
+        vm.expectRevert(DSCEngine.DSCEngine__NeedsMoreThanZero.selector);
+        engine.redeemCollateral(weth, 0);
+        vm.stopPrank();
+    }
+
+    //??? https://chat.openai.com/c/86926ddb-d3e0-4a09-89f5-7e76bb9a9083
+    function testEmitCollateralRedeemedWithCorrectArgs() public depositedCollateral {
+        emit CollateralRedeemed(USER, USER, weth, amountCollateral); //manual emit. According to chatGPT, not needed. But it can be used to compare.
+        vm.startPrank(USER);
+        vm.expectEmit(true, true, true, true, address(engine));
+
+        engine.redeemCollateral(weth, amountCollateral);
+        vm.stopPrank();
+    }
+
+    ///////////////////////////////////
+    // redeemCollateralForDsc Tests //
+    //////////////////////////////////
+
+    function testMustRedeemMoreThanZero() public depositiedCollateralAndMintedDsc {
+        // deposit and mint via the modifier
+        vm.startPrank(USER);
+        dsc.approve(address(engine), amountToMint); //the modifier contains approval only for weth. However, this is not really needed as it will revert sooneer than attempting to trasnfer DSC out from the user
+        vm.expectRevert(DSCEngine.DSCEngine__NeedsMoreThanZero.selector);
+        engine.redeemCollateralForDsc(weth, amountCollateral, 0);
+        vm.stopPrank();
+    }
+
+    function testCanRedeemDepositedCollateralCallingRedeemCollateralForDsc() public depositiedCollateralAndMintedDsc {
+        // deposited collateral and minted dsc via the modifier
+        vm.startPrank(USER);
+        dsc.approve(address(engine), amountToMint); //approve dsc to move users dsc
+        engine.redeemCollateralForDsc(weth, amountCollateral, amountToMint);
+        vm.stopPrank();
+
+        uint256 userBalance = ERC20Mock(weth).balanceOf(USER);
+        assertEq(userBalance, amountCollateral);
+
+        uint256 userBalanceDsc = dsc.balanceOf(USER); //this is from cyfrin, but I think the former is more appropriate
+        assertEq(userBalanceDsc, 0);
+    }
+
+    ///////////////////////////////////
+    // liquidation Tests //
+    //////////////////////////////////
+
+    function testCannotLiquidateGoodHealthFactor() public depositiedCollateralAndMintedDsc {
+        //deposit and mint done via the modifier
+        ERC20Mock(weth).mint(liquidator, collateralToCover);
+
+        vm.startPrank(liquidator);
+        ERC20Mock(weth).approve(address(engine), collateralToCover);
+        engine.depositCollateralAndMintDsc(weth, collateralToCover, amountToMint);
+        dsc.approve(address(engine), amountToMint); //not really neccessary, does not get to that point
+
+        vm.expectRevert(DSCEngine.DSCEngine__HealthFactorOk.selector);
+        engine.liquidate(weth, USER, amountToMint);
+        vm.stopPrank();
+    }
+
+    // this function needs its own setup
+    /* @notice The collateral price is set to 0 in the burn function of the MockMoreDebtDsc contract. 
+    * This effectively results in a HF = 0 for both the USER and the liquidator, but in a way that by this time
+    * - the initial HF of the USER has been checked (and found to be smaller than the MIN, but not 0, so theoretically it could be improved)
+    * - the liquidator's HF will be checked later, at the very end of the liquidation function, so the function will revert sooner than that
+    * 
+    * An alternative, and possibly better option would be
+    * 1. USER depositis, mints
+    * 2. collateral value falls sharply so that the HF of USER breaks
+    * 3. liquidator deposits a ton, mints
+    * 4. liquidator attempts to x from the USER's debt, that 
+    *   - would improve the USER's HF, but
+    *   - while the liquidation function runs, the collateral value crashes hard so that even with the help of the liquidator it would be less than initally
+    */
+    function testRevertIfLiquidationNotImprovesHealthFactor() public {
+        // Arrange - setup mockMoreDebtDsc
+        MockMoreDebtDsc mockMoreDebtDsc = new MockMoreDebtDsc(ethUsdPriceFeed);
+
+        // Arrange  - setup the new engine
+        tokenAddresses = [weth];
+        priceFeedAddresses = [ethUsdPriceFeed];
+        DSCEngine mockEngine = new DSCEngine(tokenAddresses, priceFeedAddresses, address(mockMoreDebtDsc));
+        mockMoreDebtDsc.transferOwnership(address(mockEngine));
+
+        // Arrange - setup USER
+        vm.startPrank(USER);
+        ERC20Mock(weth).approve(address(mockEngine), amountCollateral);
+        mockEngine.depositCollateralAndMintDsc(weth, amountCollateral, amountToMint);
+        vm.stopPrank();
+
+        // Arrange - setup liquidator
+        collateralToCover = 1 ether; // c.f. amountCollateral is 10 ether
+        ERC20Mock(weth).mint(liquidator, collateralToCover); // give the liquidator an initial collateral balance
+
+        vm.startPrank(liquidator);
+        ERC20Mock(weth).approve(address(mockEngine), collateralToCover);
+        uint256 debtToCover = 10 ether;
+        mockEngine.depositCollateralAndMintDsc(weth, collateralToCover, amountToMint);
+        mockMoreDebtDsc.approve(address(mockEngine), debtToCover); // approval is a prereq for liquidation
+
+        // Act
+        int256 ethUsdUpdatedPrice = 18e8; // 1 ETH = $18. This already destorys the USER's health factor, but later on the price is set to 0
+        MockV3Aggregator(ethUsdPriceFeed).updateAnswer(ethUsdUpdatedPrice);
+
+        // Assert
+        vm.expectRevert(DSCEngine.DSCEngine__HealthFactorNotImproved.selector);
+        /* @notice The price of the collateral is changed one again in the burn function of the MockMoreDebtDsc contract, it is set to 0.
+        * If the price is not set to zero (or a low value), then a liquidate function will return with the error messeage "DSCEngine_BreaksHealtFactor()
+        * If the price is set to 0 before the liquidation function is called, there will be a devision by 0.
+        * If the price is set to a low value before the liquidation function is called, a under/overflow error will occur.
+        */
+        mockEngine.liquidate(weth, USER, debtToCover);
+        vm.stopPrank();
+    }
+
+    //this is an alternative, and a better version of the function above.
+    //set the price in MockMoreDebtDsc.sol to i.e. 1e5, and the HF of the liquidator would be OK, in contrast to the original version
+    function testAlternativeRevertIfLiquidationNotImprovesHealthFactor() public {
+        // Arrange - setup mockMoreDebtDsc
+        MockMoreDebtDsc mockMoreDebtDsc = new MockMoreDebtDsc(ethUsdPriceFeed);
+
+        // Arrange  - setup the new engine
+        tokenAddresses = [weth];
+        priceFeedAddresses = [ethUsdPriceFeed];
+        DSCEngine mockEngine = new DSCEngine(tokenAddresses, priceFeedAddresses, address(mockMoreDebtDsc));
+        mockMoreDebtDsc.transferOwnership(address(mockEngine));
+
+        // Arrange - setup USER
+        vm.startPrank(USER);
+        ERC20Mock(weth).approve(address(mockEngine), amountCollateral);
+        mockEngine.depositCollateralAndMintDsc(weth, amountCollateral, amountToMint);
+        vm.stopPrank();
+
+        // Arrange - drop price
+        int256 ethUsdUpdatedPrice = 18e8; // 1 ETH = $18. This already destorys the USER's health factor, but later on the price is set to 0
+        MockV3Aggregator(ethUsdPriceFeed).updateAnswer(ethUsdUpdatedPrice);
+
+        // Arrange - setup liquidator
+        collateralToCover = 1 ether;
+        uint256 liquidatorStartingBalance = collateralToCover * 1e25;
+        ERC20Mock(weth).mint(liquidator, liquidatorStartingBalance); // give the liquidator a huge initial balance
+
+        vm.startPrank(liquidator);
+        ERC20Mock(weth).approve(address(mockEngine), liquidatorStartingBalance);
+        uint256 debtToCover = 10 ether; //i.e. 10 USD
+
+        mockEngine.depositCollateralAndMintDsc(weth, liquidatorStartingBalance, amountToMint);
+        mockMoreDebtDsc.approve(address(mockEngine), debtToCover); // approval is a prereq for liquidation
+
+        // Assert
+        vm.expectRevert(DSCEngine.DSCEngine__HealthFactorNotImproved.selector);
+        mockEngine.liquidate(weth, USER, debtToCover);
+        vm.stopPrank();
+    }
+
+    function testLiquidationPayoutIsCorrect() public liquidated {
+        //liquidation done via the modifier
+        //before liquidation, liquidator Weth balance is 0, since he depositied all his weth to the engine contract
+        uint256 liquidatorWethBalance = ERC20Mock(weth).balanceOf(liquidator);
+        uint256 expectedWethBalance = engine.getTokenAmountFromUsd(weth, amountToMint)
+            + (engine.getTokenAmountFromUsd(weth, amountToMint)) / engine.getLiquidationBonus();
+        uint256 hardCodedExpected = 6111111111111111110; // 18e8 * 1.1.... Dont know here this is coming from
+        assertEq(liquidatorWethBalance, hardCodedExpected);
+        assertEq(liquidatorWethBalance, expectedWethBalance);
+    }
+
+    function testUserStillHasSomeEthAfterLiquidation() public liquidated {
+        //liquidation done via the modifier
+        uint256 originalDepositValueInUsd = engine.getUsdValue(weth, amountCollateral);
+
+        //calculate how much the user lost
+        uint256 amountLiquidated = engine.getTokenAmountFromUsd(weth, amountToMint)
+            + (engine.getTokenAmountFromUsd(weth, amountToMint)) / engine.getLiquidationBonus();
+        uint256 liquidatedValueInUsd = engine.getUsdValue(weth, amountLiquidated);
+        //USER does not have any WETH balance in his address, he has WETH depositied
+        (, uint256 expectedCurrentCollateralValueInUsd) = engine.getAccountInformation(USER);
+
+        assertEq(originalDepositValueInUsd - liquidatedValueInUsd, expectedCurrentCollateralValueInUsd);
+    }
+
+    function testLiquidatorTakesOnDebt() public liquidated {
+        //liquidation done via the modifier
+        (uint256 debt,) = engine.getAccountInformation(liquidator);
+        assertEq(debt, amountToMint);
+    }
+
+    function testUserHasNoMoreDebt() public liquidated {
+        //liquidation done via the modifier
+        (uint256 debt,) = engine.getAccountInformation(USER);
+        assertEq(debt, 0);
+    }
+
+    ///////////////////////////////////
+    // View & Pure Function Tests //
+    //////////////////////////////////
+
+    function testGetCollateralTokenPriceFeed() public {
+        address priceFeed = engine.getCollateralTokenPriceFeed(weth);
+        assertEq(priceFeed, ethUsdPriceFeed);
+    }
+
+    function testCollateralTokens() public {
+        address[] memory collateralTokens = engine.getCollateralTokenAddresses();
+        assertEq(collateralTokens[0], weth);
+    }
+
+    function testMinHealthFactor() public {
+        uint256 minHf = engine.getMinHealthFactor();
+        assertEq(minHf, MIN_HEALTH_FACTOR);
+    }
+
+    function testGetLiquidationThreshold() public {
+        uint256 liquidationThreshold = engine.getLiquidationThreshold();
+        assertEq(liquidationThreshold, LIQUIDATION_THRESHOLD);
+    }
+
+    function testGetAccountCollateralValueFromInformation() public {}
 }

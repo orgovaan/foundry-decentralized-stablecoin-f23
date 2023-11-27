@@ -51,6 +51,8 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 //install: forge install smartcontractkit/chainlink-brownie-contracts@0.6.1 --no-commit
 import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+import {console} from "forge-std/console.sol"; //for logging
+import {OracleLib} from "./libraries/OracleLib.sol"; //created this lib for checking for stale prices (not working chainklink oracle)
 
 //reentrancy is one of the most common attacts in smart contracts
 contract DSCEngine is ReentrancyGuard {
@@ -65,6 +67,11 @@ contract DSCEngine is ReentrancyGuard {
     error DSCEngine__MintFailed();
     error DSCEngine__HealthFactorOk();
     error DSCEngine__HealthFactorNotImproved();
+
+    ////////////////////////////
+    ///// Types ////////////////
+    ////////////////////////////
+    using OracleLib for AggregatorV3Interface;
 
     ////////////////////////////
     ////// State vars //////////
@@ -160,9 +167,6 @@ contract DSCEngine is ReentrancyGuard {
      * @param amountCollateral the amount of collateral to deposit
     */
 
-    event testAddress(address);
-    event testBalance(uint256);
-
     function depositCollateral(address tokenCollateralAddress, uint256 amountCollateral)
         public
         moreThanZero(amountCollateral)
@@ -173,9 +177,7 @@ contract DSCEngine is ReentrancyGuard {
         emit CollateralDeposited(msg.sender, tokenCollateralAddress, amountCollateral); //we are modifying state so we should have an event emitted
         //interactions
         bool success = IERC20(tokenCollateralAddress).transferFrom(msg.sender, address(this), amountCollateral); //this returns a bool
-        emit testBalance(IERC20(tokenCollateralAddress).balanceOf(msg.sender));
         //emit testBalance(s_collateralDeposited[msg.sender][tokenCollateralAddress]);
-        emit testBalance(IERC20(tokenCollateralAddress).balanceOf(address(this)));
 
         if (!success) {
             revert DSCEngine__TransferFailed();
@@ -220,6 +222,8 @@ contract DSCEngine is ReentrancyGuard {
     function mintDsc(uint256 amountDscToMint) public moreThanZero(amountDscToMint) nonReentrant {
         s_DscMinted[msg.sender] += amountDscToMint;
         //if they minted too much:
+        console.log(_healthFactor(msg.sender)); //for tests only
+
         _revertIfHealthfactorIsBroken(msg.sender);
 
         bool minted = i_dsc.mint(msg.sender, amountDscToMint); //mint function returns a bool
@@ -391,7 +395,7 @@ contract DSCEngine is ReentrancyGuard {
     function getUsdValue(address token, uint256 amount) public view returns (uint256) {
         //for this, we need AggregatorV3Interface
         AggregatorV3Interface priceFeed = AggregatorV3Interface(s_priceFeeds[token]);
-        (, int256 price,,,) = priceFeed.latestRoundData();
+        (, int256 price,,,) = priceFeed.staleCheckLatestRoundData(); //we defined this function in a library
         //1 ETH = $1000
         //The returned value 'price' from CL wil be 1000 * 1e8 (can be checked in chainlink doc)
         //1. The price (1e8) needs to be brought up to the same precisio as amount (1e18).
@@ -405,7 +409,7 @@ contract DSCEngine is ReentrancyGuard {
         uint256 UsdAmountInWei //get token amount based off the USD
     ) public view returns (uint256 tokenAmountFromDebtCovered) {
         AggregatorV3Interface priceFeed = AggregatorV3Interface(s_priceFeeds[token]); //the new keyword is used only for creating a new instance for contracts. When using interfaces or existing contracts, one just casts the address to the contract interface. This is basically type casting.
-        (, int256 price,,,) = priceFeed.latestRoundData();
+        (, int256 price,,,) = priceFeed.staleCheckLatestRoundData(); //we defined this function in a library
         //usdAmountInWei is basically the debt to cover.
         //we should always do mupltiplication first
         // ($10e18 * 1e18) / ($2000e8 * 1e10) = 500 000 000 000 000 = 5e15 = 0.005 * e18
@@ -425,24 +429,61 @@ contract DSCEngine is ReentrancyGuard {
         (totalDscMinted, collateralValueInUsd) = _getAccountInformation(user);
     }
 
-    /*pure function: does not modifiy or read the blockchain state.
-    *Constants are part of the contract's state, but they is hardcoded into the contract's bytecode. 
-    *The function getConstant is able to return MY_CONSTANT and still be marked as pure because 
-    *it doesn't actually perform a state read at runtime; it simply returns a value that is known at compile time.
-    */
-    function getAdditionalFeedPrecision() external pure returns (uint256) {
-        return ADDITIONAL_FEED_PRECISION;
-    }
-
-    function getPrecision() external pure returns (uint256) {
-        return PRECISION;
-    }
-
     function calculateHealthFactor(uint256 totalDscMinted, uint256 collateralValueInUsd)
         external
         pure
         returns (uint256)
     {
         return _calculateHealthFactor(totalDscMinted, collateralValueInUsd);
+    }
+
+    function getHealthFactor(address user) external view returns (uint256) {
+        return _healthFactor(user);
+    }
+
+    function getCollateralTokenPriceFeed(address token) external view returns (address) {
+        return s_priceFeeds[token];
+    }
+
+    function getCollateralTokenAddresses() external view returns (address[] memory) {
+        return s_collateralTokens;
+    }
+
+    function getCollateralBalanceOfUser(address user, address token) external view returns (uint256) {
+        return s_collateralDeposited[user][token];
+    }
+
+    /*pure function: does not modifiy or read the blockchain state.
+    *Constants are part of the contract's state, but they is hardcoded into the contract's bytecode. 
+    *The function getConstant is able to return MY_CONSTANT and still be marked as pure because 
+    *it doesn't actually perform a state read at runtime; it simply returns a value that is known at compile time.
+    */
+
+    function getPrecision() external pure returns (uint256) {
+        return PRECISION;
+    }
+
+    function getAdditionalFeedPrecision() external pure returns (uint256) {
+        return ADDITIONAL_FEED_PRECISION;
+    }
+
+    function getLiquidationThreshold() external pure returns (uint256) {
+        return LIQUIDATION_THRESHOLD;
+    }
+
+    function getLiquidationBonus() external pure returns (uint256) {
+        return LIQUIDATION_BONUS;
+    }
+
+    function getLiquidationPrecision() external pure returns (uint256) {
+        return LIQUIDATION_PRECISION;
+    }
+
+    function getMinHealthFactor() external pure returns (uint256) {
+        return MIN_HEALTH_FACTOR;
+    }
+
+    function getDscAddress() external view returns (address) {
+        return address(i_dsc);
     }
 }
